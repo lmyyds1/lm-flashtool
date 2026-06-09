@@ -422,7 +422,7 @@ func main() {
 
 	// 创建界面布局
 	content := container.NewVBox(
-		widget.NewLabelWithStyle("用户登录", fyne.TextAlignCenter, fyne.TextStyle{Bold: true}),
+		widget.NewLabelWithStyle("登录", fyne.TextAlignCenter, fyne.TextStyle{Bold: true}),
 		widget.NewSeparator(),
 		widget.NewLabel("密码:"),
 		passwordEntry,
