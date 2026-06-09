@@ -78,7 +78,9 @@ func main() {
 		// 模拟登录验证
 		if username == "admin" && password == "123456" {
 			dialog.ShowInformation("登录成功", fmt.Sprintf("欢迎, %s!", username), myWindow)
-			// 登录成功后打开端口检查窗口
+			// 隐藏登录窗口
+			myWindow.Hide()
+			// 打开端口检查窗口
 			portWindow := createPortCheckWindow(myApp)
 			portWindow.Show()
 		} else {
