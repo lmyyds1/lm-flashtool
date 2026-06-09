@@ -2,18 +2,28 @@ package main
 
 import (
 	"fmt"
+	"image/color"
 	"net"
 	"os/exec"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/app"
+	"fyne.io/fyne/v2/canvas"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/dialog"
 	"fyne.io/fyne/v2/widget"
 )
+
+// hideCmdWindow 隐藏命令窗口的属性设置
+func hideCmdWindow() *syscall.SysProcAttr {
+	return &syscall.SysProcAttr{
+		HideWindow: true,
+	}
+}
 
 // checkPort 检查指定端口是否被占用
 func checkPort(port int) (bool, string) {
@@ -32,6 +42,7 @@ func checkPort(port int) (bool, string) {
 func getProcessByPort(port int) (pid int, processName string, err error) {
 	// 使用 netstat 命令查找占用端口的进程
 	cmd := exec.Command("netstat", "-ano")
+	cmd.SysProcAttr = hideCmdWindow()
 	output, err := cmd.Output()
 	if err != nil {
 		return 0, "", err
@@ -65,6 +76,7 @@ func getProcessByPort(port int) (pid int, processName string, err error) {
 // getProcessName 获取进程名称
 func getProcessName(pid int) (string, error) {
 	cmd := exec.Command("tasklist", "/FI", fmt.Sprintf("PID eq %d", pid), "/FO", "CSV", "/NH")
+	cmd.SysProcAttr = hideCmdWindow()
 	output, err := cmd.Output()
 	if err != nil {
 		return "", err
@@ -88,6 +100,7 @@ func getProcessName(pid int) (string, error) {
 // killProcess 结束指定PID的进程
 func killProcess(pid int) error {
 	cmd := exec.Command("taskkill", "/F", "/PID", strconv.Itoa(pid))
+	cmd.SysProcAttr = hideCmdWindow()
 	return cmd.Run()
 }
 
@@ -98,11 +111,13 @@ const (
 	DeviceStatusNone DeviceStatus = iota
 	DeviceStatusADB
 	DeviceStatusFastboot
+	DeviceStatusFastbootd
 )
 
 // checkADBDevices 检查是否有ADB设备连接
 func checkADBDevices() ([]string, error) {
 	cmd := exec.Command("./tools/adb.exe", "devices")
+	cmd.SysProcAttr = hideCmdWindow()
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return nil, fmt.Errorf("执行adb命令失败: %v", err)
@@ -126,6 +141,7 @@ func checkADBDevices() ([]string, error) {
 // checkFastbootDevices 检查是否有Fastboot设备连接
 func checkFastbootDevices() ([]string, error) {
 	cmd := exec.Command("./tools/fastboot.exe", "devices")
+	cmd.SysProcAttr = hideCmdWindow()
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return nil, fmt.Errorf("执行fastboot命令失败: %v", err)
@@ -146,6 +162,24 @@ func checkFastbootDevices() ([]string, error) {
 	return devices, nil
 }
 
+// checkFastbootd 判断Fastboot设备是否为Fastbootd模式
+func checkFastbootd() (bool, error) {
+	cmd := exec.Command("./tools/fastboot.exe", "getvar", "is-userspace")
+	cmd.SysProcAttr = hideCmdWindow()
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return false, fmt.Errorf("执行fastboot getvar失败: %v", err)
+	}
+
+	outputStr := strings.TrimSpace(string(output))
+	// 查找 is-userspace: yes 表示 fastbootd 模式
+	if strings.Contains(outputStr, "is-userspace: yes") {
+		return true, nil
+	}
+	// is-userspace: no 表示普通 fastboot 模式
+	return false, nil
+}
+
 // getDeviceStatus 获取当前设备状态
 func getDeviceStatus() (DeviceStatus, []string) {
 	// 先检查ADB设备
@@ -157,20 +191,48 @@ func getDeviceStatus() (DeviceStatus, []string) {
 	// 再检查Fastboot设备
 	fastbootDevices, err := checkFastbootDevices()
 	if err == nil && len(fastbootDevices) > 0 {
+		// 判断是 fastboot 还是 fastbootd
+		isFastbootd, err := checkFastbootd()
+		if err == nil && isFastbootd {
+			return DeviceStatusFastbootd, fastbootDevices
+		}
 		return DeviceStatusFastboot, fastbootDevices
 	}
 
 	return DeviceStatusNone, nil
 }
 
-// rebootToBootloader 重启设备到Fastboot模式
+// rebootToBootloader 重启设备到Fastboot模式（ADB，异步）
 func rebootToBootloader() error {
 	cmd := exec.Command("./tools/adb.exe", "reboot", "bootloader")
-	err := cmd.Run()
+	cmd.SysProcAttr = hideCmdWindow()
+	err := cmd.Start()
 	if err != nil {
 		return fmt.Errorf("执行adb reboot bootloader失败: %v", err)
 	}
+	go cmd.Wait()
 	return nil
+}
+
+// getCurrentSlot 获取当前活动槽位 (fastboot/fastbootd 模式下)
+func getCurrentSlot() (string, error) {
+	cmd := exec.Command("./tools/fastboot.exe", "getvar", "current-slot")
+	cmd.SysProcAttr = hideCmdWindow()
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("执行fastboot getvar current-slot失败: %v", err)
+	}
+
+	outputStr := strings.TrimSpace(string(output))
+	// 格式: current-slot: _a 或 current-slot: _b
+	lines := strings.Split(outputStr, "\n")
+	for _, line := range lines {
+		if strings.Contains(line, "current-slot:") {
+			slot := strings.TrimSpace(strings.TrimPrefix(line, "current-slot:"))
+			return slot, nil
+		}
+	}
+	return "", fmt.Errorf("无法解析槽位信息")
 }
 
 // createPortCheckWindow 创建端口检查窗口
@@ -235,7 +297,7 @@ func createPortCheckWindow(app fyne.App) fyne.Window {
 	checkButton.Importance = widget.HighImportance
 
 	// 左侧：端口检查区域
-	leftPanel := container.NewVBox(
+	portCheckPanel := container.NewVBox(
 		widget.NewLabelWithStyle("端口检查", fyne.TextAlignCenter, fyne.TextStyle{Bold: true}),
 		widget.NewSeparator(),
 		checkButton,
@@ -244,9 +306,30 @@ func createPortCheckWindow(app fyne.App) fyne.Window {
 		killButton,
 	)
 
-	// 设备状态显示
-	statusLabel := widget.NewLabel("未连接")
-	deviceListLabel := widget.NewLabel("")
+	// 底部：版本信息
+	versionLabel := widget.NewLabel("Version: 0.0.1 Alpha")
+	copyrightLabel := widget.NewLabel("Copyright@2026 黎明科技")
+	qqLabel := widget.NewLabel("QQ群: 816793252")
+
+	infoPanel := container.NewVBox(
+		widget.NewSeparator(),
+		widget.NewLabelWithStyle("关于", fyne.TextAlignCenter, fyne.TextStyle{Bold: true}),
+		versionLabel,
+		copyrightLabel,
+		qqLabel,
+	)
+
+	leftPanel := container.NewBorder(
+		portCheckPanel,
+		infoPanel,
+		nil, nil,
+	)
+
+	// 设备状态显示（使用 canvas.NewText 支持颜色）
+	statusText := canvas.NewText("未连接", color.RGBA{255, 0, 0, 255}) // 红色
+	statusText.TextSize = 14
+	statusText.Alignment = fyne.TextAlignLeading
+	deviceInfoLabel := widget.NewLabel("")
 
 	// 更新设备状态显示（使用 fyne.Do 在主线程中执行 UI 操作）
 	updateDeviceStatus := func() {
@@ -255,17 +338,37 @@ func createPortCheckWindow(app fyne.App) fyne.Window {
 
 		// 使用 fyne.Do 将 UI 更新调度到主线程
 		fyne.Do(func() {
+			var infoLines []string
+
 			switch status {
 			case DeviceStatusADB:
-				statusLabel.SetText("ADB模式")
-				deviceListLabel.SetText(fmt.Sprintf("设备: %s", strings.Join(devices, ", ")))
+				statusText.Text = "ADB模式"
+				statusText.Color = color.RGBA{0, 255, 0, 255} // 绿色
+				infoLines = append(infoLines, fmt.Sprintf("设备: %s", strings.Join(devices, ", ")))
 			case DeviceStatusFastboot:
-				statusLabel.SetText("Fastboot模式")
-				deviceListLabel.SetText(fmt.Sprintf("设备: %s", strings.Join(devices, ", ")))
+				statusText.Text = "Fastboot模式"
+				statusText.Color = color.RGBA{255, 255, 0, 255} // 黄色
+				infoLines = append(infoLines, fmt.Sprintf("设备: %s", strings.Join(devices, ", ")))
+				// 获取当前槽位
+				slot, err := getCurrentSlot()
+				if err == nil {
+					infoLines = append(infoLines, fmt.Sprintf("当前槽位: %s", slot))
+				}
+			case DeviceStatusFastbootd:
+				statusText.Text = "FastbootD模式"
+				statusText.Color = color.RGBA{255, 165, 0, 255} // 橙色
+				infoLines = append(infoLines, fmt.Sprintf("设备: %s", strings.Join(devices, ", ")))
+				// 获取当前槽位
+				slot, err := getCurrentSlot()
+				if err == nil {
+					infoLines = append(infoLines, fmt.Sprintf("当前槽位: %s", slot))
+				}
 			default:
-				statusLabel.SetText("未连接")
-				deviceListLabel.SetText("")
+				statusText.Text = "未连接"
+				statusText.Color = color.RGBA{255, 0, 0, 255} // 红色
 			}
+			deviceInfoLabel.SetText(strings.Join(infoLines, "\n"))
+			statusText.Refresh()
 		})
 	}
 
@@ -297,10 +400,10 @@ func createPortCheckWindow(app fyne.App) fyne.Window {
 	// 设备状态面板
 	statusPanel := container.NewVBox(
 		container.NewHBox(
-			statusLabel,
+			statusText,
 			refreshStatusBtn,
 		),
-		deviceListLabel,
+		deviceInfoLabel,
 	)
 
 	// 右侧：功能按钮区域
@@ -308,6 +411,7 @@ func createPortCheckWindow(app fyne.App) fyne.Window {
 	installDriverBtn := widget.NewButton("安装驱动", func() {
 		driverPath := "./driver/必备驱动.exe"
 		cmd := exec.Command(driverPath)
+		cmd.SysProcAttr = hideCmdWindow()
 		err := cmd.Start()
 		if err != nil {
 			dialog.ShowError(fmt.Errorf("启动驱动安装程序失败: %v", err), window)
@@ -321,37 +425,127 @@ func createPortCheckWindow(app fyne.App) fyne.Window {
 		status, _ := getDeviceStatus()
 		switch status {
 		case DeviceStatusADB:
+			// ADB模式 → 使用 adb reboot bootloader
 			err := rebootToBootloader()
 			if err != nil {
 				dialog.ShowError(err, window)
 			} else {
 				dialog.ShowInformation("提示", "正在重启设备进入Fastboot模式...", window)
-				go func() {
-					for i := 0; i < 10; i++ {
-						updateDeviceStatus()
-						cmd := exec.Command("timeout", "/t", "2", "/nobreak")
-						cmd.Run()
-					}
-				}()
+			}
+		case DeviceStatusFastbootd:
+			// Fastbootd模式 → 使用 fastboot reboot bootloader（异步）
+			cmd := exec.Command("./tools/fastboot.exe", "reboot", "bootloader")
+			cmd.SysProcAttr = hideCmdWindow()
+			err := cmd.Start()
+			if err != nil {
+				dialog.ShowError(fmt.Errorf("执行fastboot reboot bootloader失败: %v", err), window)
+			} else {
+				dialog.ShowInformation("提示", "正在重启设备进入Fastboot模式...", window)
+				go cmd.Wait()
 			}
 		case DeviceStatusFastboot:
+			// 已处于Fastboot模式
 			dialog.ShowInformation("提示", "设备已处于Fastboot模式", window)
 		default:
-			dialog.ShowError(fmt.Errorf("未检测到ADB设备，请确保设备已连接并开启USB调试"), window)
+			dialog.ShowError(fmt.Errorf("未检测到设备，请确保设备已连接并开启USB调试"), window)
 		}
 	})
 
 	fastbootdBtn := widget.NewButton("进入Fastbootd", func() {
-		dialog.ShowInformation("提示", "进入Fastbootd功能开发中...", window)
+		status, _ := getDeviceStatus()
+		switch status {
+		case DeviceStatusADB:
+			// ADB模式 → 使用 adb reboot fastboot（异步）
+			cmd := exec.Command("./tools/adb.exe", "reboot", "fastboot")
+			cmd.SysProcAttr = hideCmdWindow()
+			err := cmd.Start()
+			if err != nil {
+				dialog.ShowError(fmt.Errorf("执行adb reboot fastboot失败: %v", err), window)
+			} else {
+				dialog.ShowInformation("提示", "正在重启设备进入Fastbootd模式...", window)
+				go cmd.Wait()
+			}
+		case DeviceStatusFastboot:
+			// Fastboot模式 → 使用 fastboot reboot fastboot（异步）
+			cmd := exec.Command("./tools/fastboot.exe", "reboot", "fastboot")
+			cmd.SysProcAttr = hideCmdWindow()
+			err := cmd.Start()
+			if err != nil {
+				dialog.ShowError(fmt.Errorf("执行fastboot reboot fastboot失败: %v", err), window)
+			} else {
+				dialog.ShowInformation("提示", "正在重启设备进入Fastbootd模式...", window)
+				go cmd.Wait()
+			}
+		case DeviceStatusFastbootd:
+			// 已处于Fastbootd模式
+			dialog.ShowInformation("提示", "设备已处于Fastbootd模式", window)
+		default:
+			dialog.ShowError(fmt.Errorf("未检测到设备，请确保设备已连接并开启USB调试"), window)
+		}
 	})
 	bootSystemBtn := widget.NewButton("进入系统", func() {
-		dialog.ShowInformation("提示", "进入系统功能开发中...", window)
+		status, _ := getDeviceStatus()
+		switch status {
+		case DeviceStatusFastboot, DeviceStatusFastbootd:
+			cmd := exec.Command("./tools/fastboot.exe", "reboot")
+			cmd.SysProcAttr = hideCmdWindow()
+			err := cmd.Start()
+			if err != nil {
+				dialog.ShowError(fmt.Errorf("执行fastboot reboot失败: %v", err), window)
+			} else {
+				dialog.ShowInformation("提示", "正在重启设备进入系统...", window)
+				go cmd.Wait()
+			}
+		default:
+			dialog.ShowError(fmt.Errorf("未检测到Fastboot设备，请先进入Fastboot或Fastbootd模式"), window)
+		}
 	})
 	switchSlotBtn := widget.NewButton("切换槽位", func() {
-		dialog.ShowInformation("提示", "切换槽位功能开发中...", window)
+		// 获取当前槽位
+		slot, err := getCurrentSlot()
+		if err != nil {
+			dialog.ShowError(fmt.Errorf("获取当前槽位失败: %v", err), window)
+			return
+		}
+
+		// 确定目标槽位
+		var targetSlot string
+		switch slot {
+		case "a", "_a":
+			targetSlot = "b"
+		case "b", "_b":
+			targetSlot = "a"
+		default:
+			dialog.ShowError(fmt.Errorf("未知的当前槽位: %s", slot), window)
+			return
+		}
+
+		// 执行切换
+		cmd := exec.Command("./tools/fastboot.exe", "set_active", targetSlot)
+		cmd.SysProcAttr = hideCmdWindow()
+		err = cmd.Run()
+		if err != nil {
+			dialog.ShowError(fmt.Errorf("切换槽位失败: %v", err), window)
+		} else {
+			dialog.ShowInformation("成功", fmt.Sprintf("已切换到槽位: %s", targetSlot), window)
+			// 刷新状态显示新槽位
+			updateDeviceStatus()
+		}
 	})
 	formatBtn := widget.NewButton("格式化", func() {
-		dialog.ShowInformation("提示", "格式化功能开发中...", window)
+		dialog.ShowConfirm("确认格式化", "此操作将清除设备上的所有用户数据，确定继续吗？", func(confirm bool) {
+			if !confirm {
+				return
+			}
+			cmd := exec.Command("./tools/fastboot.exe", "-w")
+			cmd.SysProcAttr = hideCmdWindow()
+			err := cmd.Run()
+			if err != nil {
+				dialog.ShowError(fmt.Errorf("格式化失败: %v", err), window)
+			} else {
+				dialog.ShowInformation("成功", "格式化完成", window)
+			}
+		}, window)
 	})
 
 	rightPanel := container.NewVBox(
@@ -390,19 +584,18 @@ func main() {
 	myWindow := myApp.NewWindow("用户登录")
 
 	// 设置窗口大小
-	myWindow.Resize(fyne.NewSize(400, 250))
+	myWindow.Resize(fyne.NewSize(500, 250))
 
 	// 创建密码输入框
 	passwordEntry := widget.NewPasswordEntry()
 	passwordEntry.SetPlaceHolder("请输入密码")
-	passwordEntry.Resize(fyne.NewSize(300, 30)) // 调整输入框大小
 
 	// 创建登录按钮
 	loginButton := widget.NewButton("登录", func() {
 		password := passwordEntry.Text
 
 		// 模拟登录验证
-		if password == "123456" {
+		if password == "lmyyds" {
 			dialog.ShowInformation("登录成功", "欢迎使用刷机工具！", myWindow)
 			// 隐藏登录窗口
 			myWindow.Hide()
@@ -415,26 +608,19 @@ func main() {
 	})
 	loginButton.Importance = widget.HighImportance
 
-	// 创建重置按钮
-	resetButton := widget.NewButton("重置", func() {
-		passwordEntry.SetText("")
-	})
+	// 创建密码标签和输入框的布局
+	passwordContainer := container.NewBorder(nil, nil, widget.NewLabel("密码:"), nil, passwordEntry)
 
-	// 创建界面布局
+	// 创建界面布局，使用Grid确保输入框填满宽度
 	content := container.NewVBox(
 		widget.NewLabelWithStyle("登录", fyne.TextAlignCenter, fyne.TextStyle{Bold: true}),
 		widget.NewSeparator(),
-		widget.NewLabel("密码:"),
-		passwordEntry,
-		container.NewHBox(
-			widget.NewLabel(""),
-			loginButton,
-			resetButton,
-		),
+		container.NewGridWithColumns(1, passwordContainer),
+		container.NewCenter(loginButton),
 	)
 
-	// 设置主内容
-	myWindow.SetContent(container.NewCenter(content))
+	// 设置主内容，使用NewMax让内容填满窗口
+	myWindow.SetContent(content)
 
 	// 显示窗口并运行
 	myWindow.ShowAndRun()
