@@ -539,12 +539,22 @@ func createPortCheckWindow(app fyne.App) fyne.Window {
 			}
 			cmd := exec.Command("./tools/fastboot.exe", "-w")
 			cmd.SysProcAttr = hideCmdWindow()
-			err := cmd.Run()
+			err := cmd.Start()
 			if err != nil {
 				dialog.ShowError(fmt.Errorf("格式化失败: %v", err), window)
-			} else {
-				dialog.ShowInformation("成功", "格式化完成", window)
+				return
 			}
+			dialog.ShowInformation("提示", "正在格式化设备...", window)
+			go func() {
+				err := cmd.Wait()
+				fyne.Do(func() {
+					if err != nil {
+						dialog.ShowError(fmt.Errorf("格式化失败: %v", err), window)
+					} else {
+						dialog.ShowInformation("成功", "格式化完成", window)
+					}
+				})
+			}()
 		}, window)
 	})
 
